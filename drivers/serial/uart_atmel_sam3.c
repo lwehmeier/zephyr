@@ -67,8 +67,10 @@ struct _uart {
 /* Device data structure */
 struct uart_sam3_dev_data_t {
 	uint32_t baud_rate;	/* Baud rate */
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+	uart_irq_callback_t	cb;	/**< Callback function pointer */
+#endif
 };
-
 /* convenience defines */
 #define DEV_CFG(dev) \
 	((struct uart_device_config * const)(dev)->config->config_info)
@@ -87,6 +89,7 @@ struct uart_sam3_dev_data_t {
 #define UART_RHR(dev)	(*((volatile uint32_t *)(DEV_CFG(dev)->base + 0x18)))
 #define UART_THR(dev)	(*((volatile uint32_t *)(DEV_CFG(dev)->base + 0x1C)))
 #define UART_BRGR(dev)	(*((volatile uint32_t *)(DEV_CFG(dev)->base + 0x20)))
+#define NVIC_IABR       (*(volatile uint32_t *)(0xE000E300))
 
 /* bits */
 #define UART_CR_RSTRX	(1 << 2)
@@ -192,9 +195,199 @@ static int uart_sam3_init(struct device *dev)
 
 	/* Enable receiver and transmitter */
 	uart->cr = UART_CR_RXEN | UART_CR_TXEN;
-
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+	DEV_CFG(dev)->irq_config_func(dev);
+#endif
 	return 0;
 }
+#if CONFIG_UART_INTERRUPT_DRIVEN
+
+/**
+ * @brief Fill FIFO with data
+ *
+ * @param dev UART device struct
+ * @param tx_data Data to transmit
+ * @param len Number of bytes to send
+ *
+ * @return Number of bytes sent
+ */
+static int uart_sam3_fifo_fill(struct device *dev, const uint8_t *tx_data,
+				    int len)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	uint8_t num_tx = 0;
+
+	while ((len - num_tx > 0) && (uart->sr & UART_INT_TXBUFE)) {
+		uart->thr = (uint32_t)tx_data[num_tx++];
+	}
+
+	return (int)num_tx;
+}
+
+/**
+ * @brief Read data from FIFO
+ *
+ * @param dev UART device struct
+ * @param rx_data Pointer to data container
+ * @param size Container size
+ *
+ * @return Number of bytes read
+ */
+static int uart_sam3_fifo_read(struct device *dev, uint8_t *rx_data,
+				    const int size)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	uint8_t num_rx = 0;
+
+	while ((size - num_rx > 0) && (uart->sr & UART_INT_RXRDY)) {
+		rx_data[num_rx++] = (uint8_t)uart->rhr;
+	}
+	return num_rx;
+}
+/**
+ * @brief Enable TX interrupt
+ *
+ * @param dev UART device struct
+ *
+ * @return N/A
+ */
+static void uart_sam3_irq_tx_enable(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	uart->ier |= UART_INT_TXRDY;
+}
+
+/**
+ * @brief Disable TX interrupt in IER
+ *
+ * @param dev UART device struct
+ *
+ * @return N/A
+ */
+static void uart_sam3_irq_tx_disable(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+
+	uart->idr |= UART_INT_TXRDY;
+}
+
+/**
+ * @brief Check if Tx IRQ has been raised
+ *
+ * @param dev UART device struct
+ *
+ * @return 1 if a Tx IRQ is pending, 0 otherwise
+ * TODO
+ */
+static int uart_sam3_irq_tx_ready(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	return (NVIC_IABR & (1<<IRQ_UART)) && (uart->sr & (UART_INT_TXRDY));
+}
+
+/**
+ * @brief Enable RX interrupt in IER
+ *
+ * @param dev UART device struct
+ *
+ * @return N/A
+ */
+static void uart_sam3_irq_rx_enable(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	uart->ier |= UART_INT_RXRDY;
+}
+
+/**
+ * @brief Disable RX interrupt in IER
+ *
+ * @param dev UART device struct
+ *
+ * @return N/A
+ */
+static void uart_sam3_irq_rx_disable(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	uart->idr |= UART_INT_RXRDY;
+}
+
+/**
+ * @brief Check if Rx IRQ has been raised
+ *
+ * @param dev UART device struct
+ *
+ * @return 1 if an IRQ is ready, 0 otherwise
+ * TODO
+ */
+static int uart_sam3_irq_rx_ready(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	return (NVIC_IABR & (1<<IRQ_UART)) && (uart->sr & (UART_INT_RXRDY));
+}
+
+/**
+ * @brief Check if Tx or Rx IRQ is pending
+ *
+ * @param dev UART device struct
+ *
+ * @return 1 if a Tx or Rx IRQ is pending, 0 otherwise
+ * TODO
+ */
+static int uart_sam3_irq_is_pending(struct device *dev)
+{
+	volatile struct _uart *uart = UART_STRUCT(dev);
+	return (NVIC_IABR & (1<<IRQ_UART)) && (uart->sr & (UART_INT_RXRDY|UART_INT_TXRDY));
+        /* Look only at Tx and Rx data interrupt flags */
+}
+
+/**
+ * @brief Update IRQ status
+ *
+ * @param dev UART device struct
+ *
+ * @return Always 1
+ */
+static int uart_sam3_irq_update(struct device *dev)
+{
+	return 1;
+}
+
+/**
+ * @brief Set the callback function pointer for IRQ.
+ *
+ * @param dev UART device struct
+ * @param cb Callback function pointer.
+ *
+ * @return N/A
+ */
+static void uart_sam3_irq_callback_set(struct device *dev,
+					    uart_irq_callback_t cb)
+{
+	struct uart_sam3_dev_data_t * const dev_data = DEV_DATA(dev);
+	dev_data->cb = cb;
+}
+
+/**
+ * @brief Interrupt service routine.
+ *
+ * This simply calls the callback function, if one exists.
+ *
+ * @param arg Argument to ISR.
+ *
+ * @return N/A
+ */
+void uart_sam3_isr(void *arg)
+{
+	struct device *dev = arg;
+	struct uart_sam3_dev_data_t * const dev_data = DEV_DATA(dev);
+
+	if (dev_data->cb) {
+		dev_data->cb(dev);
+	}
+}
+
+#endif /* CONFIG_UART_INTERRUPT_DRIVEN */
+
 
 /**
  * @brief Poll the device for input.
@@ -246,18 +439,53 @@ static unsigned char uart_sam3_poll_out(struct device *dev,
 static struct uart_driver_api uart_sam3_driver_api = {
 	.poll_in = uart_sam3_poll_in,
 	.poll_out = uart_sam3_poll_out,
+        
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+
+	.fifo_fill = uart_sam3_fifo_fill,
+	.fifo_read = uart_sam3_fifo_read,
+	.irq_tx_enable = uart_sam3_irq_tx_enable,
+	.irq_tx_disable = uart_sam3_irq_tx_disable,
+	.irq_tx_ready = uart_sam3_irq_tx_ready,
+	.irq_rx_enable = uart_sam3_irq_rx_enable,
+	.irq_rx_disable = uart_sam3_irq_rx_disable,
+	.irq_rx_ready = uart_sam3_irq_rx_ready,
+	.irq_is_pending = uart_sam3_irq_is_pending,
+	.irq_update = uart_sam3_irq_update,
+	.irq_callback_set = uart_sam3_irq_callback_set,
+
+#endif
 };
 
+
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+static void irq_config_func_0(struct device *port);
+#endif
 static struct uart_device_config uart_sam3_dev_cfg_0 = {
 	.base = (uint8_t *)UART_ADDR,
 	.sys_clk_freq = CONFIG_UART_ATMEL_SAM3_CLK_FREQ,
+
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+	.irq_config_func = irq_config_func_0,
+#endif
 };
 
 static struct uart_sam3_dev_data_t uart_sam3_dev_data_0 = {
 	.baud_rate = CONFIG_UART_ATMEL_SAM3_BAUD_RATE,
 };
-
 DEVICE_AND_API_INIT(uart_sam3_0, CONFIG_UART_ATMEL_SAM3_NAME, &uart_sam3_init,
 		    &uart_sam3_dev_data_0, &uart_sam3_dev_cfg_0,
 		    PRIMARY, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,
 		    &uart_sam3_driver_api);
+
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
+static void irq_config_func_0(struct device *dev)
+{
+	IRQ_CONNECT(IRQ_UART,
+		    CONFIG_UART_ATMEL_SAM3_IRQ_PRI,
+		    uart_sam3_isr, DEVICE_GET(uart_sam3_0),
+		    UART_IRQ_FLAGS);
+	irq_enable(IRQ_UART);
+}
+#endif
+
